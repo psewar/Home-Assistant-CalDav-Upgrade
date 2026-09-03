@@ -7,7 +7,6 @@ from functools import partial
 import logging
 import re
 from typing import TYPE_CHECKING
-from uuid import uuid4
 
 import caldav
 
@@ -16,6 +15,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from . import caldav_store
 from .api import get_attr_value
 
 if TYPE_CHECKING:
@@ -56,39 +56,42 @@ class CalDavUpdateCoordinator(DataUpdateCoordinator[CalendarEvent | None]):
     async def async_get_events(
         self, hass: HomeAssistant, start_date: datetime, end_date: datetime
     ) -> list[CalendarEvent]:
-        """Get all events in a specific time frame."""
-        # Get event list from the current calendar
-        vevent_list = await hass.async_add_executor_job(
-            partial(
-                self.calendar.search,
-                start=start_date,
-                end=end_date,
-                event=True,
-                expand=True,
-            )
-        )
-        event_list = []
-        for event in vevent_list:
-            if not hasattr(event.instance, "vevent"):
-                _LOGGER.warning("Skipped event with missing 'vevent' property")
-                continue
-            vevent = event.instance.vevent
-            if not self.is_matching(vevent, self.search):
-                continue
-                    # Get the UID directly from the event object
+        """Get all events in a specific time frame.
 
+        Recurring series are expanded by the ``ical`` library so every occurrence carries
+        ``uid``, ``recurrence_id`` and ``rrule`` – which is what the Home Assistant calendar
+        API needs to edit or delete a single occurrence.
+        """
+        instances = await hass.async_add_executor_job(
+            caldav_store.list_events, self.calendar, start_date, end_date
+        )
+        event_list: list[CalendarEvent] = []
+        for inst in instances:
+            if not self._instance_matches(inst):
+                continue
             event_list.append(
                 CalendarEvent(
-                    uid=get_attr_value(vevent, "uid"),
-                    summary=get_attr_value(vevent, "summary") or "",
-                    start=self.to_local(vevent.dtstart.value),
-                    end=self.to_local(self.get_end_date(vevent)),
-                    location=get_attr_value(vevent, "location"),
-                    description=get_attr_value(vevent, "description"),
+                    uid=inst.uid,
+                    summary=inst.summary,
+                    start=self.to_local(inst.start),
+                    end=self.to_local(inst.end),
+                    location=inst.location,
+                    description=inst.description,
+                    rrule=inst.rrule,
+                    recurrence_id=inst.recurrence_id,
                 )
             )
-
         return event_list
+
+    def _instance_matches(self, inst: caldav_store.EventInstance) -> bool:
+        """Apply the optional ``search`` regex (custom calendars) to an instance."""
+        if self.search is None:
+            return True
+        pattern = re.compile(self.search)
+        return any(
+            value and pattern.match(value)
+            for value in (inst.summary, inst.location, inst.description)
+        )
 
     async def _async_update_data(self) -> CalendarEvent | None:
         """Get the latest data."""

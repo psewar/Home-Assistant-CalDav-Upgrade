@@ -2,37 +2,27 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 import logging
+from typing import Any
 
 import caldav
+from caldav.lib.error import DAVError
+import requests
 import voluptuous as vol
 
 from homeassistant.components.calendar import (
     ENTITY_ID_FORMAT,
     PLATFORM_SCHEMA as CALENDAR_PLATFORM_SCHEMA,
     CalendarEntity,
-    CalendarEvent,
     CalendarEntityFeature,
-    is_offset_reached,
-    EVENT_START,
-    EVENT_END,
-    EVENT_SUMMARY,
-    EVENT_DESCRIPTION,
-    EVENT_LOCATION,
+    CalendarEvent,
     EVENT_RRULE,
-    EVENT_UID,
-    EVENT_RECURRENCE_ID,
-    EVENT_RECURRENCE_RANGE,
-)
-from .const import (
-    CONF_NAME,
-    CONF_PASSWORD,
-    CONF_URL,
-    CONF_USERNAME,
-    CONF_VERIFY_SSL,
+    EVENT_SUMMARY,
+    is_offset_reached,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity import async_generate_entity_id
 from homeassistant.helpers.entity_platform import (
@@ -41,14 +31,16 @@ from homeassistant.helpers.entity_platform import (
 )
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.util import dt as dt_util
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.components.calendar import EVENT_START, EVENT_END, EVENT_SUMMARY, EVENT_DESCRIPTION, EVENT_LOCATION, EVENT_RRULE
-import vobject
-from datetime import date
-from zoneinfo import ZoneInfo
-from . import CalDavConfigEntry
-from .api import async_get_calendars, get_attr_value
+
+from . import CalDavConfigEntry, caldav_store
+from .api import async_get_calendars
+from .const import (
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_URL,
+    CONF_USERNAME,
+    CONF_VERIFY_SSL,
+)
 from .coordinator import CalDavUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,6 +57,9 @@ CONFIG_ENTRY_DEFAULT_DAYS = 7
 
 # Only allow VCALENDARs that support this component type
 SUPPORTED_COMPONENT = "VEVENT"
+
+# Errors the CalDAV transport / store raise that should surface as a clean HA error
+_WRITE_ERRORS = (caldav_store.CalDavStoreError, DAVError, requests.RequestException)
 
 PLATFORM_SCHEMA = CALENDAR_PLATFORM_SCHEMA.extend(
     {
@@ -207,11 +202,10 @@ class WebDavCalendarEntity(CoordinatorEntity[CalDavUpdateCoordinator], CalendarE
         if unique_id is not None:
             self._attr_unique_id = unique_id
         self._supports_offset = supports_offset
-        # Legg til støtte for både CREATE og UPDATE
         self._attr_supported_features = (
-            CalendarEntityFeature.CREATE_EVENT |
-            CalendarEntityFeature.UPDATE_EVENT |
-            CalendarEntityFeature.DELETE_EVENT
+            CalendarEntityFeature.CREATE_EVENT
+            | CalendarEntityFeature.UPDATE_EVENT
+            | CalendarEntityFeature.DELETE_EVENT
         )
 
     @property
@@ -225,85 +219,47 @@ class WebDavCalendarEntity(CoordinatorEntity[CalDavUpdateCoordinator], CalendarE
         """Get all events in a specific time frame."""
         return await self.coordinator.async_get_events(hass, start_date, end_date)
 
-    # Add new method for creating events
+    # ------------------------------------------------------------------ CRUD
+    # All three go through caldav_store (ical-based) so recurring series behave like
+    # Home Assistant's Local Calendar: a single occurrence, "this and future" or the
+    # whole series can be changed or deleted.
+
     async def async_create_event(self, **kwargs: Any) -> None:
-        """Add a new event to calendar."""
+        """Add a new (optionally recurring) event to the calendar."""
         try:
-            dtstart = kwargs[EVENT_START]
-            dtend = kwargs[EVENT_END]
-
-            # Convert to local time if datetime
-            if isinstance(dtstart, datetime):
-                dtstart = dt_util.as_local(dtstart)
-            elif isinstance(dtstart, date):
-                dtstart = datetime.combine(dtstart, datetime.min.time())
-                dtstart = dt_util.as_local(dtstart)
-
-            if isinstance(dtend, datetime):
-                dtend = dt_util.as_local(dtend)
-            elif isinstance(dtend, date):
-                dtend = datetime.combine(dtend, datetime.min.time())
-                dtend = dt_util.as_local(dtend)
-
-            def create_event():
-                event_data = {
-                    "summary": kwargs[EVENT_SUMMARY],
-                    "dtstart": dtstart,
-                    "dtend": dtend,
-                }
-
-                if description := kwargs.get(EVENT_DESCRIPTION):
-                    event_data["description"] = description or " "
-                if location := kwargs.get(EVENT_LOCATION):
-                    event_data["location"] = location  or " "
-                if rrule := kwargs.get(EVENT_RRULE):
-                    # Parse RRULE and add components individually
-                    rrule_parts = dict(part.split('=') for part in rrule.split(';'))
-                    event_data["rrule"] = {
-                        "freq": rrule_parts["FREQ"],
-                        "count": int(rrule_parts["COUNT"]) if "COUNT" in rrule_parts else None
-                    }
-
-                # Let the library handle the iCal creation
-                return self.coordinator.calendar.save_event(**event_data)
-
-            await self.hass.async_add_executor_job(create_event)
-            _LOGGER.info(
-                "Successfully created event: %s from %s to %s", 
-                kwargs[EVENT_SUMMARY], dtstart, dtend
+            uid = await self.hass.async_add_executor_job(
+                caldav_store.create_event, self.coordinator.calendar, dict(kwargs)
             )
-            if EVENT_RRULE in kwargs:
-                _LOGGER.info("Event created with recurrence rule: %s", kwargs[EVENT_RRULE])
-            
-            await self.coordinator.async_refresh()
-            
-        except Exception as err:
+        except _WRITE_ERRORS as err:
             _LOGGER.error("Error creating calendar event: %s", err)
             raise HomeAssistantError(f"Error creating calendar event: {err}") from err
+        _LOGGER.debug(
+            "Created event %s (%s%s)",
+            uid,
+            kwargs.get(EVENT_SUMMARY),
+            f", rrule={kwargs[EVENT_RRULE]}" if kwargs.get(EVENT_RRULE) else "",
+        )
+        await self.coordinator.async_refresh()
 
     async def async_delete_event(
         self,
         uid: str,
-        recurrence_id: datetime | None = None,
+        recurrence_id: str | None = None,
         recurrence_range: str | None = None,
     ) -> None:
-        """Delete an event."""
+        """Delete an event: whole series, one occurrence or this-and-future."""
         try:
-            def delete_event():
-                events = self.coordinator.calendar.search(
-                    event=True,
-                    uid=uid
-                )
-                if not events:
-                    _LOGGER.error("No event found with UID: %s", uid)
-                    return
-                events[0].delete()
-
-            await self.hass.async_add_executor_job(delete_event)
-            await self.coordinator.async_refresh()
-        except Exception as err:
+            await self.hass.async_add_executor_job(
+                caldav_store.delete_event,
+                self.coordinator.calendar,
+                uid,
+                recurrence_id,
+                recurrence_range,
+            )
+        except _WRITE_ERRORS as err:
             _LOGGER.error("Error deleting calendar event: %s", err)
-            raise
+            raise HomeAssistantError(f"Error deleting calendar event: {err}") from err
+        await self.coordinator.async_refresh()
 
     async def async_update_event(
         self,
@@ -312,69 +268,20 @@ class WebDavCalendarEntity(CoordinatorEntity[CalDavUpdateCoordinator], CalendarE
         recurrence_id: str | None = None,
         recurrence_range: str | None = None,
     ) -> None:
-        """Update an event on the calendar."""
+        """Update an event: whole series, one occurrence or this-and-future."""
         try:
-            def update_event():
-                _LOGGER.debug("Attempting to update event with UID: %s", uid)
-                events = self.coordinator.calendar.search(event=True, uid=uid)
-                if not events:
-                    raise HomeAssistantError(f"No event found with UID: {uid}")
-                
-                caldav_event = events[0]
-                cal = caldav_event.instance
-                vevent = cal.vevent
-
-                # Update standard properties
-                if EVENT_SUMMARY in event:
-                    vevent.summary.value = event[EVENT_SUMMARY]
-                if EVENT_START in event:
-                    vevent.dtstart.value = event[EVENT_START]
-                if EVENT_END in event:
-                    vevent.dtend.value = event[EVENT_END]
-                if EVENT_DESCRIPTION in event:
-                    if hasattr(vevent, "description"):
-                        vevent.description.value = event[EVENT_DESCRIPTION]
-                    else:
-                        vevent.add("description").value = event[EVENT_DESCRIPTION]
-                if EVENT_LOCATION in event:
-                    if hasattr(vevent, "location"):
-                        vevent.location.value = event[EVENT_LOCATION]
-                    else:
-                        vevent.add("location").value = event[EVENT_LOCATION]
-
-                # Handle recurrence updates
-                if EVENT_RRULE in event:
-                    rrule = event[EVENT_RRULE]
-                    if rrule:
-                        # If there's a recurrence rule
-                        if hasattr(vevent, "rrule"):
-                            vevent.rrule.value = rrule
-                        else:
-                            vevent.add("rrule").value = rrule
-                        _LOGGER.debug("Updated RRULE to: %s", rrule)
-                    elif hasattr(vevent, "rrule"):
-                        # If there's no recurrence rule but the event had one, remove it
-                        vevent.remove(vevent.rrule)
-                        _LOGGER.debug("Removed RRULE from event")
-
-                # Handle recurrence ID for specific instance modifications
-                if recurrence_id:
-                    if hasattr(vevent, "recurrence-id"):
-                        vevent.remove(vevent["recurrence-id"])
-                    vevent.add("recurrence-id").value = recurrence_id
-                    _LOGGER.debug("Added recurrence-id: %s", recurrence_id)
-
-                # Update the CalDAV event data and save
-                caldav_event.data = cal.serialize()
-                return caldav_event.save()
-
-            await self.hass.async_add_executor_job(update_event)
-            _LOGGER.info("Successfully updated event with UID: %s", uid)
-            await self.coordinator.async_refresh()
-            
-        except Exception as err:
-            _LOGGER.error("Error updating calendar event: %s", err, exc_info=True)
+            await self.hass.async_add_executor_job(
+                caldav_store.update_event,
+                self.coordinator.calendar,
+                uid,
+                dict(event),
+                recurrence_id,
+                recurrence_range,
+            )
+        except _WRITE_ERRORS as err:
+            _LOGGER.error("Error updating calendar event: %s", err)
             raise HomeAssistantError(f"Error updating calendar event: {err}") from err
+        await self.coordinator.async_refresh()
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -395,55 +302,3 @@ class WebDavCalendarEntity(CoordinatorEntity[CalDavUpdateCoordinator], CalendarE
         """When entity is added to hass update state from existing coordinator data."""
         await super().async_added_to_hass()
         self._handle_coordinator_update()
-
-
-from homeassistant.components.calendar import CalendarEntity, CalendarEntityFeature
-from homeassistant.config_entries import ConfigEntry
-
-class CalDavCalendarManagement(CalendarEntity):
-    """Calendar management entity."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Calendar Management"
-    _attr_icon = "mdi:calendar-multiple"
-
-    def __init__(self, coordinator, entry: ConfigEntry) -> None:
-        """Initialize the calendar management."""
-        super().__init__()
-        self.coordinator = coordinator
-        self.entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_management"
-        self._calendars = []
-        self._update_calendars()
-
-    async def _update_calendars(self) -> None:
-        """Update list of available calendars."""
-        self._calendars = await self.coordinator.client.list_calendars()
-
-    async def create_calendar(self, name: str) -> None:
-        """Create a new calendar."""
-        try:
-            await self.coordinator.client.create_calendar(name)
-            await self._update_calendars()
-            await self.coordinator.async_refresh()
-        except Exception as err:
-            raise HomeAssistantError(f"Failed to create calendar: {err}")
-
-    async def delete_calendar(self, calendar_id: str) -> None:
-        """Delete a calendar."""
-        try:
-            await self.coordinator.client.delete_calendar(calendar_id)
-            await self._update_calendars()
-            await self.coordinator.async_refresh()
-        except Exception as err:
-            raise HomeAssistantError(f"Failed to delete calendar: {err}")
-
-    @property
-    def extra_state_attributes(self):
-        """Return the list of available calendars."""
-        return {
-            "calendars": [
-                {"name": cal.name, "id": cal.id} 
-                for cal in self._calendars
-            ]
-        }
