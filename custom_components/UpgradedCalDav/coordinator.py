@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from functools import partial
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -94,20 +93,26 @@ class CalDavUpdateCoordinator(DataUpdateCoordinator[CalendarEvent | None]):
         )
 
     async def _async_update_data(self) -> CalendarEvent | None:
-        """Get the latest data."""
+        """Get the latest data (the next upcoming event, for the entity state)."""
         start_of_today = dt_util.start_of_local_day()
         start_of_tomorrow = dt_util.start_of_local_day() + timedelta(days=self.days)
+        # Everything below touches the network and parses iCalendar data (vobject reads
+        # timezone files), so it runs as one job off the event loop.
+        return await self.hass.async_add_executor_job(
+            self._next_event, start_of_today, start_of_tomorrow
+        )
 
+    def _next_event(
+        self, start_of_today: datetime, start_of_tomorrow: datetime
+    ) -> CalendarEvent | None:
+        """Blocking: fetch today's events and pick the next matching one."""
         # We have to retrieve the results for the whole day as the server
         # won't return events that have already started
-        results = await self.hass.async_add_executor_job(
-            partial(
-                self.calendar.search,
-                start=start_of_today,
-                end=start_of_tomorrow,
-                event=True,
-                expand=True,
-            ),
+        results = self.calendar.search(
+            start=start_of_today,
+            end=start_of_tomorrow,
+            event=True,
+            expand=True,
         )
 
         # Create new events for each recurrence of an event that happens today.

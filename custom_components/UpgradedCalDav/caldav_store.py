@@ -83,7 +83,80 @@ def parse_range(value: str | None) -> Range:
 
 def _calendar_from_resource(obj: caldav.CalendarObjectResource) -> Calendar:
     obj.load(only_if_unloaded=True)
-    return IcsCalendarStream.calendar_from_ics(obj.data)
+    _LOGGER.debug("CalDAV resource %s:\n%s", getattr(obj, "url", "?"), obj.data)
+    cal = IcsCalendarStream.calendar_from_ics(obj.data)
+    _normalize_exdates(cal)
+    return cal
+
+
+def _normalize_exdates(cal: Calendar) -> None:
+    """Make date-only EXDATEs effective on timed series.
+
+    Horde/Kronolith keeps recurrence exceptions per *day* and exports them as
+    ``EXDATE;VALUE=DATE:20260906`` even when DTSTART is a datetime. RFC 5545 wants the
+    EXDATE value type to match DTSTART, and ``ical`` ignores a date for a timed occurrence
+    – the deleted or moved instance would keep showing up. Convert such values to the
+    occurrence's datetime (same wall-clock time and zone as DTSTART).
+    """
+    for e in cal.events:
+        if not e.rrule or not isinstance(e.dtstart, dt.datetime) or not e.exdate:
+            continue
+        e.exdate = [
+            x if isinstance(x, dt.datetime) else dt.datetime.combine(x, e.dtstart.timetz())
+            for x in e.exdate
+        ]
+
+
+def _exclude_overridden(cal: Calendar) -> None:
+    """Hide master occurrences that have a RECURRENCE-ID override (listing only).
+
+    Per RFC 5545 an override *replaces* the occurrence it names; no EXDATE is needed.
+    ``ical`` only drops the original when an EXDATE exists as well, and servers such as
+    Horde don't write one for overridden dates – the moved instance would show up twice.
+    Add the exclusion in memory before expanding.
+    """
+    masters = {e.uid: e for e in cal.events if e.rrule and not e.recurrence_id}
+    for e in cal.events:
+        if not e.recurrence_id or e.uid not in masters:
+            continue
+        m = masters[e.uid]
+        rid: dt.datetime | dt.date = RecurrenceId.to_value(e.recurrence_id)
+        if isinstance(m.dtstart, dt.datetime):
+            tz = m.dtstart.tzinfo
+            if isinstance(rid, dt.datetime):
+                if rid.tzinfo is None and tz is not None:
+                    rid = rid.replace(tzinfo=tz)  # floating id = wall clock in the master's zone
+                elif rid.tzinfo is not None and tz is not None:
+                    rid = rid.astimezone(tz)
+            else:
+                rid = dt.datetime.combine(rid, m.dtstart.timetz())
+        elif isinstance(rid, dt.datetime):
+            rid = rid.date()
+        if rid not in m.exdate:
+            m.exdate.append(rid)
+
+
+def _ref_tz(cal: Calendar, uid: str) -> dt.tzinfo | None:
+    """Timezone of the series master (for comparing recurrence ids in wall-clock terms)."""
+    for e in cal.events:
+        if e.uid == uid and not e.recurrence_id and isinstance(e.dtstart, dt.datetime):
+            return e.dtstart.tzinfo
+    return None
+
+
+def _key(value: dt.datetime | dt.date, tz: dt.tzinfo | None) -> dt.datetime:
+    """Comparable naive datetime: aware values are expressed in ``tz`` first.
+
+    Recurrence ids come back in different shapes (floating ``20260906T050000``, Horde's
+    UTC ``20260906T030000Z``, TZID-tagged) and must still identify the same occurrence.
+    """
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is not None:
+            if tz is not None:
+                value = value.astimezone(tz)
+            return value.replace(tzinfo=None)
+        return value
+    return dt.datetime.combine(value, dt.time.min)
 
 
 def _instance_from_ical(event: Event) -> EventInstance:
@@ -156,6 +229,7 @@ def list_events(
             if (fallback := _instance_from_vobject(obj)) is not None:
                 out.append(fallback)
             continue
+        _exclude_overridden(cal)
         # An exception instance (RECURRENCE-ID override) carries no RRULE of its own; report
         # the series' rule anyway so clients can show "part of a weekly series".
         master_rules = {
@@ -212,10 +286,44 @@ def _load_resource(
         raise CalDavStoreError(f"Event {uid} could not be parsed: {err}") from err
 
 
-def _naive(value: dt.datetime | dt.date) -> dt.datetime:
-    if isinstance(value, dt.datetime):
-        return value.replace(tzinfo=None)
-    return dt.datetime.combine(value, dt.time.min)
+def _count_to_until(
+    cal: Calendar, uid: str, recurrence_id: str | None, recurrence_range: str | None
+) -> None:
+    """Express a master's COUNT as UNTIL before a this-and-future split.
+
+    ``ical`` derives the fork's COUNT by counting occurrences before the *new* start. When
+    the new start lies later in the day than the old occurrence, that occurrence is counted
+    as well and COUNT can reach zero (validation error). With UNTIL (= last occurrence of
+    the series as it is now) both halves simply end where the series ended before.
+    """
+    if not recurrence_id or parse_range(recurrence_range) != Range.THIS_AND_FUTURE:
+        return
+    for e in cal.events:
+        if e.uid != uid or e.recurrence_id or not e.rrule:
+            continue
+        until = e.rrule.until
+        if e.rrule.count:
+            occurrences = list(e.as_rrule() or [])
+            if not occurrences:
+                continue
+            until = occurrences[-1]
+            e.rrule.count = None
+        if isinstance(until, dt.datetime):
+            # Bound the series by the END of its last day: the forked half starts at the
+            # new time of day, which may lie after the old occurrence – an UNTIL before
+            # DTSTART is invalid and servers reject it (Radicale: 400).
+            tz = e.dtstart.tzinfo if isinstance(e.dtstart, dt.datetime) else None
+            if until.tzinfo is not None and tz is not None:
+                local = until.astimezone(tz)
+            elif until.tzinfo is None and tz is not None:
+                local = until.replace(tzinfo=tz)
+            else:
+                local = until
+            until = dt.datetime.combine(local.date(), dt.time(23, 59, 59), tzinfo=local.tzinfo)
+            if until.tzinfo is not None:
+                until = until.astimezone(dt.timezone.utc)  # RFC 5545: UNTIL in UTC for zoned DTSTART
+        if until is not None:
+            e.rrule.until = until
 
 
 def _split_forked_series(cal: Calendar, uid: str) -> None:
@@ -233,8 +341,9 @@ def _split_forked_series(cal: Calendar, uid: str) -> None:
     forks = [e for e in cal.events if e.uid == uid and e.recurrence_id and e.rrule]
     if not forks:
         return
+    tz = _ref_tz(cal, uid)
     for fork in forks:
-        split_at = _naive(RecurrenceId.to_value(fork.recurrence_id))
+        split_at = _key(RecurrenceId.to_value(fork.recurrence_id), tz)
         cal.events = [
             e
             for e in cal.events
@@ -243,7 +352,7 @@ def _split_forked_series(cal: Calendar, uid: str) -> None:
                 and e is not fork
                 and e.recurrence_id
                 and not e.rrule
-                and _naive(RecurrenceId.to_value(e.recurrence_id)) >= split_at
+                and _key(RecurrenceId.to_value(e.recurrence_id), tz) >= split_at
             )
         ]
         idx = cal.events.index(fork)
@@ -265,20 +374,21 @@ def _detach_override(
     """
     if not recurrence_id or parse_range(recurrence_range) != Range.THIS_AND_FUTURE:
         return
-    rid_value = _naive(RecurrenceId.to_value(recurrence_id))
+    tz = _ref_tz(cal, uid)
+    rid_value = _key(RecurrenceId.to_value(recurrence_id), tz)
     overrides = [
         e
         for e in cal.events
         if e.uid == uid
         and e.recurrence_id
-        and _naive(RecurrenceId.to_value(e.recurrence_id)) == rid_value
+        and _key(RecurrenceId.to_value(e.recurrence_id), tz) == rid_value
     ]
     if not overrides:
         return
     cal.events = [e for e in cal.events if not any(e is o for o in overrides)]
     for master in cal.events:
         if master.uid == uid and master.rrule and not master.recurrence_id and master.exdate:
-            master.exdate = [x for x in master.exdate if _naive(x) != rid_value]
+            master.exdate = [x for x in master.exdate if _key(x, tz) != rid_value]
 
 
 def _write_back(
@@ -291,7 +401,9 @@ def _write_back(
     keep = [e for e in cal.events if e.uid == uid]
     others = [e for e in cal.events if e.uid != uid]
     if keep:
-        obj.data = _ics_for(cal, keep)
+        ics = _ics_for(cal, keep)
+        _LOGGER.debug("CalDAV PUT %s:\n%s", getattr(obj, "url", "?"), ics)
+        obj.data = ics
         obj.save()
     else:
         obj.delete()
@@ -320,6 +432,7 @@ def update_event(
     obj, cal = _load_resource(calendar, uid)
     event = _build_event(params)
     _detach_override(cal, uid, recurrence_id, recurrence_range)
+    _count_to_until(cal, uid, recurrence_id, recurrence_range)
     try:
         EventStore(cal).edit(
             uid,
