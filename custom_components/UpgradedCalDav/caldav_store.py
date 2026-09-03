@@ -89,22 +89,36 @@ def _calendar_from_resource(obj: caldav.CalendarObjectResource) -> Calendar:
     return cal
 
 
-def _normalize_exdates(cal: Calendar) -> None:
-    """Make date-only EXDATEs effective on timed series.
+_DAY_BASED_FREQ = {"DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
 
-    Horde/Kronolith keeps recurrence exceptions per *day* and exports them as
-    ``EXDATE;VALUE=DATE:20260906`` even when DTSTART is a datetime. RFC 5545 wants the
-    EXDATE value type to match DTSTART, and ``ical`` ignores a date for a timed occurrence
-    – the deleted or moved instance would keep showing up. Convert such values to the
-    occurrence's datetime (same wall-clock time and zone as DTSTART).
+
+def _normalize_exdates(cal: Calendar) -> None:
+    """Make Horde-style EXDATEs effective on timed series.
+
+    Horde/Kronolith keeps recurrence exceptions per *day*. It exports them either as a
+    bare date (``EXDATE;VALUE=DATE:20260906``) or – after a client wrote a zoned value –
+    as the invalid mix ``EXDATE;TZID=Europe/Zurich:20260905T030000Z`` (TZID *and* a UTC
+    suffix, the time shifted to UTC). ``ical`` then sees a value that matches no
+    occurrence and the deleted instance keeps showing up. For day-based rules (DAILY …
+    YEARLY there is at most one occurrence per day) snap every EXDATE to the occurrence
+    of its day: same wall-clock time and zone as DTSTART.
     """
     for e in cal.events:
         if not e.rrule or not isinstance(e.dtstart, dt.datetime) or not e.exdate:
             continue
-        e.exdate = [
-            x if isinstance(x, dt.datetime) else dt.datetime.combine(x, e.dtstart.timetz())
-            for x in e.exdate
-        ]
+        freq = str(getattr(e.rrule.freq, "value", e.rrule.freq)).upper()
+        if freq not in _DAY_BASED_FREQ:
+            continue
+        tz = e.dtstart.tzinfo
+        fixed: list[dt.datetime | dt.date] = []
+        for x in e.exdate:
+            if isinstance(x, dt.datetime):
+                local = x.astimezone(tz) if (x.tzinfo is not None and tz is not None) else x
+                day = local.date()
+            else:
+                day = x
+            fixed.append(dt.datetime.combine(day, e.dtstart.timetz()))
+        e.exdate = fixed
 
 
 def _exclude_overridden(cal: Calendar) -> None:
