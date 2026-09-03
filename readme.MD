@@ -62,9 +62,25 @@ Through the UI: server URL, username, password, optional SSL verification.
 
 ## Tested with
 
-- Horde / Kronolith (via `rpc.php` CalDAV)
+- Horde / Kronolith (via `rpc.php` CalDAV) – live-tested: create series, edit one
+  occurrence, this-and-future split, delete one occurrence
 - Radicale (the end-to-end test suite runs against it)
 - Baikal / Nextcloud were reported working with the original fork
+
+### Horde / Kronolith notes
+
+Kronolith keeps recurrence exceptions **per day**, which shows in what it hands back:
+
+- It writes **no EXDATE** for an occurrence that has an override (RECURRENCE-ID). The
+  listing therefore always hides the master occurrence an override replaces.
+- A client-written `EXDATE;TZID=Europe/Zurich:20260905T050000` comes back as the invalid
+  `EXDATE;TZID=Europe/Zurich:20260905T030000Z` (TZID *and* UTC suffix, time shifted to UTC),
+  or as `EXDATE;VALUE=DATE:20260905`. For day-based rules every EXDATE is snapped to the
+  occurrence of its day, so deleted instances stay deleted.
+- Floating `RECURRENCE-ID:20260906T050000` is stored back as UTC `20260906T030000Z`;
+  recurrence ids are compared as wall-clock instants in the master's zone, so both forms
+  address the same occurrence.
+- `UNTIL` is kept but re-expressed as end of day (`…T215959Z`).
 
 ## Development
 
