@@ -156,8 +156,18 @@ def list_events(
             if (fallback := _instance_from_vobject(obj)) is not None:
                 out.append(fallback)
             continue
+        # An exception instance (RECURRENCE-ID override) carries no RRULE of its own; report
+        # the series' rule anyway so clients can show "part of a weekly series".
+        master_rules = {
+            e.uid: e.rrule.as_rrule_str()
+            for e in cal.events
+            if e.rrule and not e.recurrence_id
+        }
         for event in cal.timeline_tz(tzinfo).overlapping(start, end):
-            out.append(_instance_from_ical(event))
+            inst = _instance_from_ical(event)
+            if inst.recurrence_id and not inst.rrule:
+                inst.rrule = master_rules.get(inst.uid)
+            out.append(inst)
     return out
 
 
@@ -242,6 +252,35 @@ def _split_forked_series(cal: Calendar, uid: str) -> None:
         )
 
 
+def _detach_override(
+    cal: Calendar, uid: str, recurrence_id: str | None, recurrence_range: str | None
+) -> None:
+    """Make a this-and-future change on an *exception* instance act on the series.
+
+    ``ical`` matches an exception instance (RECURRENCE-ID override) only by its own
+    component, so a this-and-future edit/delete would just touch that one component and
+    leave the series alone. What the user means is "from this occurrence on". So drop the
+    override and the EXDATE that shadows its slot in the master; the store then splits the
+    master at this occurrence like for any other instance.
+    """
+    if not recurrence_id or parse_range(recurrence_range) != Range.THIS_AND_FUTURE:
+        return
+    rid_value = _naive(RecurrenceId.to_value(recurrence_id))
+    overrides = [
+        e
+        for e in cal.events
+        if e.uid == uid
+        and e.recurrence_id
+        and _naive(RecurrenceId.to_value(e.recurrence_id)) == rid_value
+    ]
+    if not overrides:
+        return
+    cal.events = [e for e in cal.events if not any(e is o for o in overrides)]
+    for master in cal.events:
+        if master.uid == uid and master.rrule and not master.recurrence_id and master.exdate:
+            master.exdate = [x for x in master.exdate if _naive(x) != rid_value]
+
+
 def _write_back(
     calendar: caldav.Calendar,
     obj: caldav.CalendarObjectResource,
@@ -280,6 +319,7 @@ def update_event(
     """Update a whole series (no recurrence_id), one instance or this-and-future."""
     obj, cal = _load_resource(calendar, uid)
     event = _build_event(params)
+    _detach_override(cal, uid, recurrence_id, recurrence_range)
     try:
         EventStore(cal).edit(
             uid,
@@ -300,6 +340,7 @@ def delete_event(
 ) -> None:
     """Delete a whole series (no recurrence_id), one instance or this-and-future."""
     obj, cal = _load_resource(calendar, uid)
+    _detach_override(cal, uid, recurrence_id, recurrence_range)
     try:
         EventStore(cal).delete(
             uid,

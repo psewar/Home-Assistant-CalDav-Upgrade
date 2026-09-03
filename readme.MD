@@ -1,83 +1,86 @@
 # Home Assistant CalDAV Integration with Event Management
 
-This is an enhanced version of the default Home Assistant CalDAV integration, adding full support for calendar event management directly from the Home Assistant UI.
+An enhanced version of the Home Assistant CalDAV integration (domain `n0tcaldav`,
+shown as **UpgradedCalDav**) that adds full event management from the Home Assistant UI
+and from custom cards – **including recurring events**.
+
+This repository is a fork of
+[TheOddPirate/Home-Assistant-CalDav-Upgrade](https://github.com/TheOddPirate/Home-Assistant-CalDav-Upgrade)
+with the recurrence handling rebuilt on the [`ical`](https://github.com/allenporter/ical)
+library (the one Home Assistant's own *Local Calendar* uses). Config entries created with
+the original are compatible – same domain, same settings.
 
 ## Features
 
-- All original CalDAV integration features
-- Create new calendar events
-- Delete existing events
-- Edit event details including:
-  - Summary/Title
-  - Start/End times
-  - Description
-  - Location
-  - Recurrence rules (recurring events)
+- All original CalDAV integration features (read-only calendar entities, next-event state)
+- **Create** events, optionally with a recurrence rule (`rrule`, e.g. `FREQ=WEEKLY;BYDAY=TU`)
+- **Edit** and **delete** events – for a series either
+  - a **single occurrence** (written as an exception / `EXDATE`, the series stays intact),
+  - **this and all future** occurrences (the series ends before this one via `UNTIL` and a
+    new series with its own UID starts here – the way Apple/Google clients split a series,
+    so Horde, Thunderbird, phones … all agree), or
+  - the **whole series**
+- Occurrences returned to Home Assistant carry `uid`, `recurrence_id` and `rrule`, so the
+  built-in calendar dialogs and custom cards can address one occurrence
+- Events are stored with `TZID` + `VTIMEZONE`, so a weekly 17:00 stays 17:00 across DST
+- Unknown properties of foreign events (`X-…`, `VALARM`, attendees) survive edits
+
+### What changed compared to the original fork
+
+| Operation | Original | This fork |
+| --- | --- | --- |
+| Create with `rrule` | crashed without `COUNT`, dropped `INTERVAL`/`BYDAY` | full RRULE |
+| Create (plain) | wrote the event but raised *Type 'str' cannot be serialized* | clean |
+| Update one occurrence | wrote a `RECURRENCE-ID` into the series **master** | exception instance |
+| Update this-and-future | ignored | `UNTIL` + new series |
+| Delete one occurrence | deleted the **whole series** | `EXDATE` |
+| Listing | no `recurrence_id` / `rrule` | both present |
 
 ## Installation
 
-### HACS (Recommended)|
-1. Add this repository to HACS as a custom repository
-2. Install the integration through HACS
-3. Restart Home Assistant
+### HACS (recommended)
 
-### Manual Installation
-1. Copy the `custom_components/caldav` directory to your Home Assistant's custom_components directory
-2. Restart Home Assistant
+1. HACS → three-dot menu → **Custom repositories** → add this repository, category *Integration*
+2. Install **UpgradedCalDav** and restart Home Assistant
+3. Settings → Devices & services → *Add integration* → **UpgradedCalDav**
+
+If you come from the original fork: uninstall it in HACS, add this repository, install, restart.
+The existing config entry keeps working (same domain `n0tcaldav`).
+
+### Manual
+
+Copy `custom_components/UpgradedCalDav` into your `custom_components` folder and restart.
 
 ## Configuration
 
-Configure the integration through the Home Assistant UI:
-1. Go to Settings -> Devices & Services
-2. Click "Add Integration"
-3. Search for "UpgradedCalDav"
-4. Enter your CalDAV server details:
-   - Server URL
-   - Username
-   - Password
-   - Optional: Verify SSL certificate
-
-## Usage
-
-After configuration:
-- Your CalDAV calendars will appear in Home Assistant's calendar UI
-- Create new events using the "+" button
-- Edit events by clicking on them and using the edit button
-- Delete events using the delete option in the event details view
-
-## Supported CalDAV Servers
-
-This integration has been tested with:
-- Baikal
-- NextCloud
-- Others using the CalDAV standard should work as well
+Through the UI: server URL, username, password, optional SSL verification.
 
 ## Requirements
 
-- Home Assistant 2023.x or newer
-- A CalDAV-compatible server
-- Python packages:
-  - caldav==1.3.9
-  - icalendar==6.1.0
+- Home Assistant 2026.8 or newer (pins `ical==14.1.1`; the manifest requires `ical>=14.1.1`)
+- Python packages: `caldav==1.3.9`, `icalendar==6.1.0`, `ical>=14.1.1`
+
+## Tested with
+
+- Horde / Kronolith (via `rpc.php` CalDAV)
+- Radicale (the end-to-end test suite runs against it)
+- Baikal / Nextcloud were reported working with the original fork
+
+## Development
+
+`caldav_store.py` has no Home Assistant imports and can be exercised against any CalDAV
+server. The end-to-end test (`tests/e2e_radicale.py` in the development workspace) covers:
+single events, weekly series, DST stability, single-occurrence edit, this-and-future split,
+`EXDATE`, `UNTIL`, whole-series delete, all-day Mo–Fr series, a Horde-style resource round
+trip (X-properties and alarms preserved) and the error paths.
 
 ## Credits
 
-This integration is a fork of the official Home Assistant CalDAV integration, enhanced with event management capabilities. Thanks to:
 - The Home Assistant team for the original CalDAV integration
-- The CalDAV library maintainers
-
-### Development Note
-
-This integration was developed with the assistance of GitHub Copilot, which helped:
-- Implement full CRUD operations for calendar events
-- Debug and resolve timezone handling issues
-- Add proper recurring event support
-- Ensure compatibility with various CalDAV servers
+- [TheOddPirate](https://github.com/TheOddPirate) for the editable fork this builds on
+- [allenporter/ical](https://github.com/allenporter/ical) for the RFC 5545 heavy lifting
+- The `caldav` library maintainers
 
 ## Contributing
 
-Feel free to submit issues and pull requests to help improve this integration.
-
-## License
-
-This project is licensed under the Apache License 2.0 - see the LICENSE file for home assistant for details
+Issues and pull requests welcome.
