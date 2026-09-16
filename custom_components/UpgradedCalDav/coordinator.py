@@ -8,10 +8,11 @@ import re
 from typing import TYPE_CHECKING
 
 import caldav
+from caldav.lib.error import DAVError
 
 from homeassistant.components.calendar import CalendarEvent, extract_offset
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from . import caldav_store
@@ -108,12 +109,20 @@ class CalDavUpdateCoordinator(DataUpdateCoordinator[CalendarEvent | None]):
         """Blocking: fetch today's events and pick the next matching one."""
         # We have to retrieve the results for the whole day as the server
         # won't return events that have already started
-        results = self.calendar.search(
-            start=start_of_today,
-            end=start_of_tomorrow,
-            event=True,
-            expand=True,
-        )
+        try:
+            results = self.calendar.search(
+                start=start_of_today,
+                end=start_of_tomorrow,
+                event=True,
+                expand=True,
+            )
+        except DAVError as err:
+            # Transient server-side trouble (a 500 on the REPORT query, a dropped
+            # connection, ...). Let the coordinator report a normal update failure
+            # and retry on the next interval instead of logging a traceback.
+            raise UpdateFailed(
+                f"CalDAV server error while fetching {self.calendar.name}: {err}"
+            ) from err
 
         # Create new events for each recurrence of an event that happens today.
         # For recurring events, some servers return the original event with recurrence rules
